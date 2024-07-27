@@ -3,6 +3,7 @@ use nix::sys::ptrace;
 use nix::sys::signal;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
+use std::collections::HashMap;
 use std::process::Child;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -31,6 +32,10 @@ fn child_traceme() -> Result<(), std::io::Error> {
     )))
 }
 
+fn align_addr_to_word(addr: u64) -> u64 {
+    addr & (-(size_of::<u64>() as i64) as u64)
+}
+
 pub struct Inferior {
     child: Child,
 }
@@ -38,7 +43,7 @@ pub struct Inferior {
 impl Inferior {
     /// Attempts to start a new inferior process. Returns Some(Inferior) if successful, or None if
     /// an error is encountered.
-    pub fn new(target: &str, args: &Vec<String>) -> Option<Inferior> {
+    pub fn new(target: &str, args: &Vec<String>, breakpoints: &mut HashMap<u64, u8>) -> Option<Inferior> {
         // TODO: implement me!
         let mut cmd = Command::new(target);
         cmd.args(args);
@@ -46,17 +51,47 @@ impl Inferior {
             cmd.pre_exec(child_traceme);
         }
         let child = cmd.spawn().ok()?;
-        let inferior = Inferior{child};
+        let mut inferior = Inferior{child};
+        
         if inferior.wait(None).is_ok() {
+            for &it in breakpoints.clone().keys(){
+                match inferior.write_byte(it, 0xcc){//0xcc corresponds to the INT ("interrupt") instruction
+                    Ok(orig_byte) => {breakpoints.insert(it, orig_byte);},
+                    Err(_) => println!("Invalid breakpoint address: {:#x}", it),
+                }
+            }
             return Some(inferior);
         }
-
         None
     }
 
-    pub fn keep(&self) -> Result<Status, nix::Error>{
+    //continue to run
+    pub fn keep(&mut self, breakpoints: &HashMap<u64, u8>) -> Result<Status, nix::Error>{
+        let mut regs = ptrace::getregs(self.pid())?;
+        let rip = regs.rip;
+        if let Some(_) = breakpoints.get(&(rip-1)){
+            ptrace::step(self.pid(), None)?;
+            match self.wait(None).unwrap(){
+                Status::Stopped(_, _) => {
+                    //restore 0xcc in the breakpoint location
+                    self.write_byte(rip-1, 0xcc)?;
+                },
+                Status::Exited(exit_code) => return Ok(Status::Exited(exit_code)),
+                Status::Signaled(signal) => return Ok(Status::Signaled(signal)),
+            }
+        }
+
         ptrace::cont(self.pid(), None)?;
-        self.wait(None)
+        let result = self.wait(None); 
+
+        if let Some(orig_byte) = breakpoints.get(&(rip-1)){
+            //restore the first byte of the instruction we replaced
+            self.write_byte(rip, *orig_byte)?;
+            //rewind the instruction pointer
+            regs.rip = rip - 1;
+            ptrace::setregs(self.pid(), regs)?;
+        }  
+        result
     }
 
     pub fn kill(&mut self) -> Pid {
@@ -66,7 +101,7 @@ impl Inferior {
     }
 
     pub fn print_backtrace(&self, debug_data: &DwarfData) -> Result<(), nix::Error>{
-        let regs = ptrace::getregs(self.pid()).ok().unwrap();
+        let regs = ptrace::getregs(self.pid())?;
         let mut rip = regs.rip as usize;//instruction_ptr
         let mut rbp = regs.rbp as usize;//base_ptr
         loop{
@@ -99,5 +134,20 @@ impl Inferior {
             }
             other => panic!("waitpid returned unexpected status: {:?}", other),
         })
+    }
+
+    pub fn write_byte(&mut self, addr: u64, val: u8) -> Result<u8, nix::Error> {
+        let aligned_addr = align_addr_to_word(addr);
+        let byte_offset = addr - aligned_addr;
+        let word = ptrace::read(self.pid(), aligned_addr as ptrace::AddressType)? as u64;
+        let orig_byte = (word >> 8 * byte_offset) & 0xff;
+        let masked_word = word & !(0xff << 8 * byte_offset);
+        let updated_word = masked_word | ((val as u64) << 8 * byte_offset);
+        ptrace::write(
+            self.pid(),
+            aligned_addr as ptrace::AddressType,
+            updated_word as *mut std::ffi::c_void,
+        )?;
+        Ok(orig_byte as u8)
     }
 }

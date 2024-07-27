@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use crate::debugger_command::DebuggerCommand;
 use crate::inferior::{Inferior, Status};
-use crate::dwarf_data::{DwarfData, Error as DwarfError};
+use crate::dwarf_data::{self, DwarfData, Error as DwarfError};
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 
@@ -10,6 +11,7 @@ pub struct Debugger {
     readline: Editor<()>,
     inferior: Option<Inferior>,
     debug_data: DwarfData,
+    breakpoints: HashMap<u64, u8>,
 }
 
 impl Debugger {
@@ -27,6 +29,7 @@ impl Debugger {
                 std::process::exit(1);
             }
         };
+        debug_data.print();
 
         let history_path = format!("{}/.deet_history", std::env::var("HOME").unwrap());
         let mut readline = Editor::<()>::new();
@@ -39,6 +42,7 @@ impl Debugger {
             readline,
             inferior: None,
             debug_data,
+            breakpoints: HashMap::new(),
         }
     }
 
@@ -50,13 +54,13 @@ impl Debugger {
                         let pid = self.inferior.as_mut().unwrap().kill();
                         println!("Killing running inferior (pid {})", pid);
                     }
-                    if let Some(inferior) = Inferior::new(&self.target, &args) {
+                    if let Some(inferior) = Inferior::new(&self.target, &args, &mut self.breakpoints) {
                         // Create the inferior
                         self.inferior = Some(inferior);
                         // TODO (milestone 1): make the inferior run                 
                         // You may use self.inferior.as_mut().unwrap() to get a mutable reference
                         // to the Inferior object
-                        let status = self.inferior.as_mut().unwrap().keep().ok().unwrap();
+                        let status = self.inferior.as_mut().unwrap().keep(&self.breakpoints).expect("Something Occurs during 'Run' !");
                         match status{
                             Status::Exited(exit) => println!("Child exited (status {})", exit),
                             Status::Signaled(signal) => println!("Child output signal {} ",signal),
@@ -81,11 +85,16 @@ impl Debugger {
                 }
                 DebuggerCommand::Continue => {
                     if self.inferior.is_some(){
-                        let status = self.inferior.as_mut().unwrap().keep().ok().unwrap();
+                        let status = self.inferior.as_mut().unwrap().keep(&self.breakpoints).expect("Something Occurs during 'Continue' !");
                         match status{
                             Status::Exited(exit) => println!("Child exited (status {})", exit),
                             Status::Signaled(signal) => println!("Child output signal {} ",signal),
-                            Status::Stopped(signal, val) => println!("Child stopped (signal {})", signal)
+                            Status::Stopped(signal, rip) => {
+                                println!("Child stopped (signal {})", signal);
+                                let line = DwarfData::get_line_from_addr(&self.debug_data, rip).unwrap();
+                                let function = DwarfData::get_function_from_addr(&self.debug_data, rip).unwrap();
+                                println!("Stopped at '{}' {}",function, line);
+                            }
                         }
                     }
                     else{
@@ -99,6 +108,40 @@ impl Debugger {
                     else{
                         println!("No running inferior exit!");
                     }
+                }
+                DebuggerCommand::Break(args) =>{
+                    let address;
+                    let addr = args.as_str();
+                    if addr.starts_with("*"){                      
+                        address = parse_address(&addr[1..]);
+                    }
+                    else if let Some(line) = usize::from_str_radix(&args, 10).ok(){                     
+                        if let Some(_address) = self.debug_data.get_addr_for_line(None,line){
+                            address = Some(_address as u64);
+                        }
+                        else{
+                            println!("Invalid position to set breakpoint!");
+                            continue;
+                        }           
+                    }
+                    else if let Some(_address) = self.debug_data.get_addr_for_function(None, addr){
+                        address = Some(_address as u64);
+                    }
+                    else{
+                        println!("Invalid position to set breakpoint!");
+                        continue;
+                    }
+                   
+                    if self.inferior.is_some(){
+                        if let Some(instruction) = self.inferior.as_mut().unwrap().write_byte(address.unwrap(), 0xcc).ok(){
+                            self.breakpoints.insert(address.unwrap(), instruction);
+                            println!("Set breakpoint {} at {:#x}",self.breakpoints.len(), address.unwrap());
+                        }
+                    }
+                    else{
+                        self.breakpoints.insert(address.unwrap(), 0);
+                        println!("Set breakpoint {} at {:#x}",self.breakpoints.len(), address.unwrap());
+                    }                              
                 }
             }
         }
@@ -144,4 +187,13 @@ impl Debugger {
             }
         }
     }
+}
+
+fn parse_address(addr: &str) -> Option<u64> {
+    let addr_without_0x = if addr.to_lowercase().starts_with("0x") {
+        &addr[2..]
+    } else {
+        &addr
+    };
+    u64::from_str_radix(addr_without_0x, 16).ok()
 }

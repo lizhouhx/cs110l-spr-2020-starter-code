@@ -1,4 +1,4 @@
-use crossbeam_channel;
+use std::sync::mpsc;
 use std::{thread, time};
 
 fn parallel_map<T, U, F>(mut input_vec: Vec<T>, num_threads: usize, f: F) -> Vec<U>
@@ -8,7 +8,31 @@ where
     U: Send + 'static + Default,
 {
     let mut output_vec: Vec<U> = Vec::with_capacity(input_vec.len());
-    // TODO: implement parallel map!
+    unsafe{output_vec.set_len(input_vec.len())}
+    let mut threads = Vec::new();
+    let (sender, receiver) = mpsc::channel();
+    let (s, r) = mpsc::channel();  
+    while !input_vec.is_empty(){
+        let idx = input_vec.len() - 1;
+        let value = input_vec.pop().unwrap();
+        s.send((idx, value)).expect("Found no r");
+    }
+    drop(s);
+    for _ in 0..num_threads{  
+        while let Ok((idx, value)) = r.recv(){
+            let sender = sender.clone();
+            threads.push(thread::spawn(move ||{ 
+                    sender.send((idx, f(value))).expect("Found no receiver");                                 
+            }))
+        }           
+    }
+    drop(sender);   
+    while let Ok((idx, value)) = receiver.recv(){
+        output_vec[idx] = value;
+    }   
+    for thread in threads{
+        thread.join().expect("Panic occurred in threads");
+    }
     output_vec
 }
 

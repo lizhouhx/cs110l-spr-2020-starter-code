@@ -90,13 +90,14 @@ async fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::E
     let mut rng = rand::rngs::StdRng::from_entropy();   
     loop{
         let read = state.live_upstream.read().await;
-        let upstream_idx = rng.gen_range(0..state.upstream_addresses.len());
-        let upstream_ip = read.get(upstream_idx).unwrap().clone();
+        let upstream_idx = rng.gen_range(0..read.len());
+        let upstream_ip = &read.get(upstream_idx).unwrap().clone();
         drop(read);
 
         match TcpStream::connect(upstream_ip).await {
             Ok(stream) => return Ok(stream),
-            Err(_) => {
+            Err(err) => {
+                log::error!("Fail to connect to upstream {}: {}",upstream_ip, err);
                 let mut write = state.live_upstream.write().await;
                 write.swap_remove(upstream_idx);
                 if write.len() == 0{

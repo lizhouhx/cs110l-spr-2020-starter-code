@@ -80,7 +80,7 @@ impl BalanceBeam {
         });
 
         // Hack: wait for executable to start running
-        sleep(Duration::from_secs(1)).await;
+        sleep(std::time::Duration::from_secs(1)).await;
         BalanceBeam { child, address }
     }
 

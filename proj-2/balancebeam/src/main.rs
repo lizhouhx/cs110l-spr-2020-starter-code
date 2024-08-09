@@ -3,8 +3,10 @@ mod response;
 
 use clap::Parser;
 use rand::{Rng, SeedableRng};
-use std::{io::{self, Error, ErrorKind}, sync::Arc};
-use tokio::{net::{TcpListener, TcpStream}, sync::RwLock};
+use request::write_to_stream;
+use response::read_from_stream;
+use std::{io::{self, Error, ErrorKind}, sync::Arc, time::Duration};
+use tokio::{net::{TcpListener, TcpStream}, stream, sync::RwLock, time::Instant};
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -76,14 +78,64 @@ async fn main() -> io::Result<()> {
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
     };
-    while let Ok((stream, _)) = listener.accept().await {      
-        // Handle the connection!
-        let state = state.clone();
-        tokio::spawn(async move{   
-            handle_connection(stream, &state).await;
-        });  
+
+    let state_clone = state.clone();
+    tokio::spawn(async move{
+        active_health_check(&state_clone).await;
+    });
+
+    loop{
+        if let Ok((stream, _)) = listener.accept().await {      
+            // Handle the connection!
+            let state = state.clone();
+            tokio::spawn(async move{           
+                handle_connection(stream, &state).await;
+            });  
+        }
     } 
-    Ok(()) 
+}
+
+async fn active_health_check(state: &ProxyState){   
+    loop{        
+        tokio::time::sleep(Duration::from_secs(state.active_health_check_interval.try_into().unwrap())).await;
+        let mut write = state.live_upstream.write().await;
+        write.clear();
+        for stream in &state.upstream_addresses{          
+            if let Ok(mut tcp_stream) = TcpStream::connect(stream).await{
+                let request = http::Request::builder()
+                    .method(http::Method::GET)
+                    .uri(&state.active_health_check_path)
+                    .header("Host", stream)
+                    .body(Vec::new())
+                    .unwrap();
+                if let Err(err) = write_to_stream(&request, &mut tcp_stream).await{
+                    log::error!("Fail to write request to stream {}: {}", stream, err);
+                    return;
+                }
+                
+                let response = match read_from_stream(&mut tcp_stream, request.method()).await{
+                    Ok(response) => response,
+                    Err(error) => {
+                        log::error!("Error reading response from server: {:?}", error);
+                        return;
+                    }
+                };
+                match response.status().as_u16(){
+                    200 => {
+                        write.push(stream.clone());
+                    }
+                    _ => {
+                        log::error!("Get unexpected response from upstream {}", stream);
+                        return;
+                    }
+                }
+            } 
+            else{
+                log::error!("Fail to connect to upstream {}",stream);
+                return;
+            }
+        }  
+    }  
 }
 
 async fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> {
@@ -93,7 +145,7 @@ async fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::E
         let upstream_idx = rng.gen_range(0..read.len());
         let upstream_ip = &read.get(upstream_idx).unwrap().clone();
         drop(read);
-
+        
         match TcpStream::connect(upstream_ip).await {
             Ok(stream) => return Ok(stream),
             Err(err) => {
